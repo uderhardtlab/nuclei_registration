@@ -1,191 +1,181 @@
-# Multi-round nucleus label matcher using sparse LAPJV-style assignment (optimized for ~15k nuclei)
-# Type: code/python
-
-"""
-This script matches nuclei across multiple 3D segmentation mask TIFFs using a sparse, optimal 1:1 assignment
-based on Euclidean distance between centroids. It is optimized for ~15k nuclei per round and avoids dense
-matrices by using KDTree neighbor queries + OR-Tools MinCostFlow for sparse assignment.
-
-Features:
-- True 1:1 optimal assignment using sparse graph.
-- Handles unmatched nuclei and optional one-to-many splits post-pass.
-- Efficient for tens of thousands of nuclei.
-- Saves relabeled masks and mapping CSVs.
-"""
-
 import numpy as np
-import tifffile
 from skimage.measure import regionprops
 from scipy.spatial import cKDTree
-from ortools.graph.python import min_cost_flow
-import csv
+from ortools.graph.python import max_flow, min_cost_flow
+import tifffile
 import os
-import argparse
-
-# -------------------------
-# Helper functions
-# -------------------------
-
-def load_mask(path):
-    return tifffile.imread(path)
+import porespy as ps
 
 
-def extract_centroids_and_labels(labeled):
-    print("extracting centroids")
-    props = regionprops(labeled)
+# Feature extraction
+def extract_centroids_and_labels(labeled): # TODO, spacing):
+    props = ps.metrics.regionprops_3D(labeled) # TODO, spacing=spacing)
     centroids = np.array([p.centroid for p in props], dtype=float)
     label_ids = np.array([p.label for p in props], dtype=int)
-    return labeled, centroids, label_ids
+    volumes = np.array([p.area for p in props], dtype=float)
+    sphericities = np.array([p.sphericity for p in props], dtype=float)
+    return centroids, label_ids, volumes, sphericities
 
 
-def build_sparse_edges(ref_pts, mov_pts, max_radius, k_neighbors=20, cost_scale=1000):
-    print("building edges")
+# Build sparse edges with additional features
+def build_sparse_edges(ref_pts, ref_vol, ref_sph, mov_pts, mov_vol, mov_sph, max_distance, k_neighbors, cost_scale, w_pos, w_vol, w_sph, r_max, s_max):
     tree_mov = cKDTree(mov_pts)
-    edges = []  # (ref_idx, mov_idx, int_cost)
+    edges = []  # list of (ref_idx, mov_idx, int_cost)
 
     for ref_idx, ref_pt in enumerate(ref_pts):
-        neighbors = tree_mov.query(ref_pt, k=k_neighbors, distance_upper_bound=max_radius)
-        dists, mov_indices = neighbors
+        dists, mov_indices = tree_mov.query(ref_pt, k=k_neighbors, distance_upper_bound=max_distance)
         if np.isscalar(dists):
-            if dists <= max_radius and mov_indices < len(mov_pts):
-                edges.append((ref_idx, mov_indices, int(round(dists*cost_scale))))
-        else:
-            for dist, mov_idx in zip(dists, mov_indices):
-                if dist != np.inf and mov_idx < len(mov_pts):
-                    edges.append((ref_idx, mov_idx, int(round(dist*cost_scale))))
+            dists, mov_indices = np.array([dists]), np.array([mov_indices])
+        for dist, mov_idx in zip(dists, mov_indices):
+            if dist != np.inf and mov_idx < len(mov_pts):
+                vol_ratio = ref_vol[ref_idx] / (mov_vol[mov_idx] + 1e-8)
+                sph_diff = abs(ref_sph[ref_idx] - mov_sph[mov_idx])
+                if not (1/r_max <= vol_ratio <= r_max):
+                    continue  # reject edge
+                if sph_diff > s_max:
+                    continue  # reject edge
+                # compute cost normally
+                cost = w_pos*dist + w_vol*abs(np.log(vol_ratio)) + w_sph*sph_diff
+                edges.append((ref_idx, mov_idx, int(round(cost*cost_scale))))
     return edges
 
 
-def sparse_assignment(ref_pts, mov_pts, edges):
-    print("sparse assignment")
-    n_ref = len(ref_pts)
-    n_mov = len(mov_pts)
+# Max-flow to compute feasible matching size
+def compute_max_flow(edges):
+    ref_has_edge = sorted(set(ref for ref,_,_ in edges))
+    mov_has_edge = sorted(set(mov for _,mov,_ in edges))
+    ref_map = {old:i for i, old in enumerate(ref_has_edge)}
+    mov_map = {old:i for i, old in enumerate(mov_has_edge)}
 
-    start_nodes = []
-    end_nodes = []
-    capacities = []
-    unit_costs = []
+    edges_compact = [(ref_map[r], mov_map[m], c) for r,m,c in edges]
+    nR, nM = len(ref_has_edge), len(mov_has_edge)
+    S, T = nR + nM, nR + nM + 1
 
-    # Build MinCostFlow graph
-    S = n_ref + n_mov  # source node
-    T = n_ref + n_mov + 1  # sink node
+    mf = max_flow.SimpleMaxFlow()
+    for r in range(nR):
+        mf.add_arc_with_capacity(S, r, 1)
+    for r, m, _ in edges_compact:
+        mf.add_arc_with_capacity(r, nR + m, 1)
+    for m in range(nM):
+        mf.add_arc_with_capacity(nR + m, T, 1)
 
-    # edges from source to ref nodes
-    for i in range(n_ref):
-        start_nodes.append(S)
-        end_nodes.append(i)
-        capacities.append(1)
-        unit_costs.append(0)
+    status = mf.solve(S, T)
+    if status != mf.OPTIMAL:
+        raise RuntimeError("Max flow solver failed")
+    return mf, edges_compact, ref_map, mov_map, nR, nM, S, T
 
-    # edges from mov nodes to sink
-    for j in range(n_mov):
-        start_nodes.append(n_ref + j)
-        end_nodes.append(T)
-        capacities.append(1)
-        unit_costs.append(0)
 
-    # edges ref -> mov (sparse candidate edges)
-    for ref_idx, mov_idx, cost in edges:
-        start_nodes.append(ref_idx)
-        end_nodes.append(n_ref + mov_idx)
-        capacities.append(1)
-        unit_costs.append(cost)
-
-    # supplies: S = total_flow, T = -total_flow, others = 0
-    total_flow = min(n_ref, n_mov)
-    supplies = [0]*(n_ref + n_mov + 2)
-    supplies[S] = total_flow
-    supplies[T] = -total_flow
+# Min-cost flow for optimal assignment
+def sparse_assignment(edges):
+    if len(edges) == 0:
+        return {}  # nothing to match
+    mf_max, edges_compact, ref_map, mov_map, nR, nM, S, T = compute_max_flow(edges)
+    max_match = mf_max.optimal_flow()
+    if max_match == 0:
+        return {}
 
     mcf = min_cost_flow.SimpleMinCostFlow()
+    all_arcs = []
 
-    for s, e, cap, cost in zip(start_nodes, end_nodes, capacities, unit_costs):
-        mcf.add_arc_with_capacity_and_unit_cost(s, e, cap, cost)
+    # S -> ref
+    for r in range(nR):
+        all_arcs.append(mcf.add_arc_with_capacity_and_unit_cost(S, r, 1, 0))
+    # ref -> mov
+    for r, m, cost in edges_compact:
+        all_arcs.append(mcf.add_arc_with_capacity_and_unit_cost(r, nR + m, 1, cost))
+    # mov -> T
+    for m in range(nM):
+        all_arcs.append(mcf.add_arc_with_capacity_and_unit_cost(nR + m, T, 1, 0))
 
-    for node, supply in enumerate(supplies):
-        mcf.set_nodes_supplies(node, supply)
+    supplies = [0]*(nR+nM+2)
+    supplies[S] = max_match
+    supplies[T] = -max_match
+    mcf.set_nodes_supplies(np.arange(len(supplies), dtype=np.int32), supplies)
 
     status = mcf.solve()
     if status != mcf.OPTIMAL:
-        raise RuntimeError('Sparse assignment solver did not find optimal solution')
+        raise RuntimeError("Sparse assignment solver did not find optimal solution")
 
-    # Extract mapping ref -> mov
-    mapping = {}  # mov_idx -> ref_idx
-    for i in range(mcf.num_arcs()):
-        if mcf.flows(i) > 0:
-            start = mcf.tail(i)
-            end = mcf.head(i)
-            if start < n_ref and n_ref <= end < n_ref + n_mov:
-                ref_idx = start
-                mov_idx = end - n_ref
-                mapping[mov_idx] = ref_idx
-    return mapping
+    solution_flows = mcf.flows(all_arcs)
+    ref_keys_sorted = sorted(ref_map.keys())
+    mov_keys_sorted = sorted(mov_map.keys())
 
-
-def match_one_round_sparse(ref_centroids, ref_labels, mov_centroids, mov_labels, max_radius=8.0, k_neighbors=20, cost_scale=1000):
-    print("matching")
-    edges = build_sparse_edges(ref_centroids, mov_centroids, max_radius=max_radius, k_neighbors=k_neighbors, cost_scale=cost_scale)
-    idx_map = sparse_assignment(ref_centroids, mov_centroids, edges)
-
-    # convert idx_map (mov_idx -> ref_idx) to label mapping
     mapping = {}
-    for mov_idx, ref_idx in idx_map.items():
-        mapping[int(mov_labels[mov_idx])] = int(ref_labels[ref_idx])
+    for arc, flow in zip(all_arcs, solution_flows):
+        if flow == 0:
+            continue
+        tail, head = mcf.tail(arc), mcf.head(arc)
+        if tail < nR and nR <= head < nR+nM:
+            ref_idx = tail
+            mov_idx = head - nR
+            mapping[mov_keys_sorted[mov_idx]] = ref_keys_sorted[ref_idx]
 
-    # unmatched moving labels will be assigned new IDs later
     return mapping
 
 
-def relabel_mask(mov_labeled_mask, mapping, next_free_label):
-    print("relabelling")
-    out = np.zeros_like(mov_labeled_mask, dtype=np.int32)
-    unique_mov = np.unique(mov_labeled_mask)
-    for ml in unique_mov:
-        if ml == 0:
+# Relabel mask
+def relabel_mask(mask, mapping):
+    max_label = mask.max()
+    lut = np.arange(max_label+1, dtype=np.int32)
+    
+    all_labels = set(np.unique(mask))
+    mapped_labels = set(mapping.keys())
+    unmatched_labels = all_labels - mapped_labels - {0}  # exclude background
+    print("#Unmatched labels (will be lost):", len(unmatched_labels))
+    
+    for old_label in np.unique(mask):
+        if old_label == 0:
             continue
-        ml = int(ml)
-        if ml in mapping:
-            out[mov_labeled_mask == ml] = mapping[ml]
+        if old_label in mapping:
+            lut[old_label] = mapping[old_label]
         else:
-            out[mov_labeled_mask == ml] = next_free_label
-            mapping[ml] = next_free_label
-            next_free_label += 1
-    return out, next_free_label
+            lut[old_label] = 0
+    return lut[mask]
 
-# -------------------------
-# Multi-round orchestration
-# -------------------------
 
-def match_multi_round_sparse(mask_path, out_prefix, max_radius=8.0, k_neighbors=20, cost_scale=1000, save_mapping_csv=True):
-    mask_paths = [os.path.join(mask_path, f) for f  in os.listdir(mask_path) if f.startswith("aligned")]
-    n = len(mask_paths)
+# Multi-round matching
+def match_one_round_sparse(ref_cents, ref_labels, ref_vol, ref_sph, mov_cents, mov_labels, mov_vol, mov_sph, max_distance, k_neighbors, cost_scale, w_pos, w_vol, w_sph, r_max, s_max):
+    edges = build_sparse_edges(ref_cents, ref_vol, ref_sph,
+                               mov_cents, mov_vol, mov_sph,
+                               max_distance=max_distance,
+                               k_neighbors=k_neighbors,
+                               cost_scale=cost_scale,
+                               w_pos=w_pos, w_vol=w_vol, w_sph=w_sph, r_max=r_max, s_max=s_max)
+    idx_map = sparse_assignment(edges)
+    mapping = {int(mov_labels[mov_idx]): int(ref_labels[ref_idx]) for mov_idx, ref_idx in idx_map.items()}
+    return mapping
 
-    masks, labeled, cents, label_ids = [], [], [], []
+def match_multi_round_sparse(mask_path, out_prefix, max_distance, k_neighbors, cost_scale, w_pos, w_vol, w_sph, save_mapping_csv, r_max, s_max): # TODO, spacing):
+    mask_files = [f for f in os.listdir(mask_path) if f.startswith("aligned")]
+    mask_files.sort()
+    masks = [tifffile.imread(os.path.join(mask_path, f)) for f in mask_files]
 
-    for p in mask_paths:
-        mask = load_mask(p)
-        lab, c, ids = extract_centroids_and_labels(mask)
-        masks.append(mask)
-        labeled.append(lab)
-        cents.append(c)
-        label_ids.append(ids)
+    cents_list, labels_list, vol_list, sph_list = [], [], [], []
+    for mask in masks:
+        c, l, v, e = extract_centroids_and_labels(mask) # TODO, spacing=spacing)
+        cents_list.append(c)
+        labels_list.append(l)
+        vol_list.append(v)
+        sph_list.append(e)
 
-    ref_cents = cents[0]
-    ref_ids = label_ids[0]
+    ref_cents, ref_labels, ref_vol, ref_sph = cents_list[0], labels_list[0], vol_list[0], sph_list[0]
 
-    next_free = int(np.max(ref_ids)) + 1 if len(ref_ids) > 0 else 1
+    # Save reference mask
+    tifffile.imwrite(f"{out_prefix}_round01_matched.tif", masks[0].astype(np.int32), compression="zlib")
 
-    # save reference mask as-is
-    tifffile.imwrite(f'{out_prefix}_round01_matched.tif', labeled[0].astype(np.int32), compression="zlib")
-
-    for i in range(1, n):
-        mapping = match_one_round_sparse(ref_cents, ref_ids, cents[i], label_ids[i], max_radius=max_radius, k_neighbors=k_neighbors, cost_scale=cost_scale)
-        relabeled_mask, next_free = relabel_mask(labeled[i], mapping, next_free)
-        out_path = f'{out_prefix}_round{i+1:02d}_matched.tif'
+    for i in range(1, len(masks)):
+        mapping = match_one_round_sparse(ref_cents, ref_labels, ref_vol, ref_sph,
+                                         cents_list[i], labels_list[i], vol_list[i], sph_list[i],
+                                         max_distance=max_distance, k_neighbors=k_neighbors,
+                                         cost_scale=cost_scale,
+                                         w_pos=w_pos, w_vol=w_vol, w_sph=w_sph, r_max=r_max, s_max=s_max)
+        relabeled_mask = relabel_mask(masks[i], mapping)
+        out_path = f"{out_prefix}_round{i+1:02d}_matched.tif"
         tifffile.imwrite(out_path, relabeled_mask.astype(np.int32), compression="zlib")
 
         if save_mapping_csv:
-            csv_path = f'{out_prefix}_round{i+1:02d}_mapping.csv'
+            import csv
+            csv_path = f"{out_prefix}_round{i+1:02d}_mapping.csv"
             with open(csv_path, 'w', newline='') as csvfile:
                 writer = csv.writer(csvfile)
                 writer.writerow(['moving_label', 'assigned_ref_label'])
@@ -193,16 +183,16 @@ def match_multi_round_sparse(mask_path, out_prefix, max_radius=8.0, k_neighbors=
                     writer.writerow([mov_label, mapping[mov_label]])
 
 
-# -------------------------
-# CLI
-# -------------------------
+# CLI / example usage
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Match nucleus labels across multiple 3D mask TIFFs (reference = first mask)')
-    parser.add_argument('--masks', required=True, help='Paths to mask dir; first is reference')
-    parser.add_argument('--out-prefix', default='matched', help='Prefix for output files')
-    parser.add_argument('--max-radius', type=float, default=8.0, help='Maximum centroid distance (voxels) to consider for matching')
-    parser.add_argument('--allow-split', type=int, choices=[0,1], default=0, help='If 1, allow one-to-many mapping after core 1:1 Hungarian assignment')
-    parser.add_argument('--no-csv', dest='save_csv', action='store_false', help='Do not save mapping CSV files')
-    args = parser.parse_args()
-
-    match_multi_round_sparse(args.masks, args.out_prefix, max_radius=args.max_radius, k_neighbors=20, cost_scale=1000, save_mapping_csv=args.save_csv)
+    masks = "/data/bionets/je30bery/point_set_matching/data"
+    out_prefix = "/data/bionets/je30bery/point_set_matching/data/IBEX"
+    max_distance = 30
+    r_max = 1.5 # factor by which volumes of two matched nuclei can differ
+    s_max = 0.3 # maximum absolute difference in sphericity for two matched nuclei
+    w_pos = 1.0
+    w_vol = 50.0
+    w_sph = 100.0
+    # TODO spacing = [1, 1, 1]
+    match_multi_round_sparse(masks, out_prefix, max_distance=max_distance, k_neighbors=10, cost_scale=1000,
+                             w_pos=w_pos, w_vol=w_vol, w_sph=w_sph, save_mapping_csv=True, r_max=r_max, s_max=s_max) # TODO, spacing=spacing)
