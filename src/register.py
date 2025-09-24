@@ -66,7 +66,7 @@ def compute_max_flow(edges):
 
 
 # Min-cost flow for optimal assignment
-def sparse_assignment(edges):
+def sparse_assignment(edges, max_cardinality_percentage):
     if len(edges) == 0:
         return {}  # nothing to match
     mf_max, edges_compact, ref_map, mov_map, nR, nM, S, T = compute_max_flow(edges)
@@ -77,19 +77,20 @@ def sparse_assignment(edges):
     mcf = min_cost_flow.SimpleMinCostFlow()
     all_arcs = []
 
+    capacity = 1
     # S -> ref
     for r in range(nR):
-        all_arcs.append(mcf.add_arc_with_capacity_and_unit_cost(S, r, 1, 0))
+        all_arcs.append(mcf.add_arc_with_capacity_and_unit_cost(S, r, capacity, 0))
     # ref -> mov
     for r, m, cost in edges_compact:
-        all_arcs.append(mcf.add_arc_with_capacity_and_unit_cost(r, nR + m, 1, cost))
+        all_arcs.append(mcf.add_arc_with_capacity_and_unit_cost(r, nR + m, capacity, cost))
     # mov -> T
     for m in range(nM):
-        all_arcs.append(mcf.add_arc_with_capacity_and_unit_cost(nR + m, T, 1, 0))
+        all_arcs.append(mcf.add_arc_with_capacity_and_unit_cost(nR + m, T, capacity, 0))
 
     supplies = [0]*(nR+nM+2)
-    supplies[S] = max_match
-    supplies[T] = -max_match
+    supplies[S] = max_cardinality_percentage*max_match
+    supplies[T] = -max_cardinality_percentage*max_match
     mcf.set_nodes_supplies(np.arange(len(supplies), dtype=np.int32), supplies)
 
     status = mcf.solve()
@@ -110,6 +111,7 @@ def sparse_assignment(edges):
             mov_idx = head - nR
             mapping[mov_keys_sorted[mov_idx]] = ref_keys_sorted[ref_idx]
 
+    print("Total cost", int(mcf.optimal_cost()))  
     return mapping
 
 
@@ -122,6 +124,7 @@ def relabel_mask(mask, mapping):
     mapped_labels = set(mapping.keys())
     unmatched_labels = all_labels - mapped_labels - {0}  # exclude background
     print("#Unmatched labels (will be lost):", len(unmatched_labels))
+    print("#Matched labels:", len(mapped_labels))
     
     for old_label in np.unique(mask):
         if old_label == 0:
@@ -134,18 +137,18 @@ def relabel_mask(mask, mapping):
 
 
 # Multi-round matching
-def match_one_round_sparse(ref_cents, ref_labels, ref_vol, ref_sph, mov_cents, mov_labels, mov_vol, mov_sph, max_distance, k_neighbors, cost_scale, w_pos, w_vol, w_sph, r_max, s_max):
+def match_one_round_sparse(ref_cents, ref_labels, ref_vol, ref_sph, mov_cents, mov_labels, mov_vol, mov_sph, max_distance, k_neighbors, cost_scale, w_pos, w_vol, w_sph, r_max, s_max, max_cardinality_percentage):
     edges = build_sparse_edges(ref_cents, ref_vol, ref_sph,
                                mov_cents, mov_vol, mov_sph,
                                max_distance=max_distance,
                                k_neighbors=k_neighbors,
                                cost_scale=cost_scale,
                                w_pos=w_pos, w_vol=w_vol, w_sph=w_sph, r_max=r_max, s_max=s_max)
-    idx_map = sparse_assignment(edges)
+    idx_map = sparse_assignment(edges, max_cardinality_percentage)
     mapping = {int(mov_labels[mov_idx]): int(ref_labels[ref_idx]) for mov_idx, ref_idx in idx_map.items()}
     return mapping
 
-def match_multi_round_sparse(mask_path, out_prefix, max_distance, k_neighbors, cost_scale, w_pos, w_vol, w_sph, save_mapping_csv, r_max, s_max): # TODO, spacing):
+def match_multi_round_sparse(mask_path, out_prefix, max_distance, k_neighbors, cost_scale, w_pos, w_vol, w_sph, save_mapping_csv, r_max, s_max, max_cardinality_percentage): # TODO, spacing):
     mask_files = [f for f in os.listdir(mask_path) if f.startswith("aligned")]
     mask_files.sort()
     masks = [tifffile.imread(os.path.join(mask_path, f)) for f in mask_files]
@@ -168,7 +171,7 @@ def match_multi_round_sparse(mask_path, out_prefix, max_distance, k_neighbors, c
                                          cents_list[i], labels_list[i], vol_list[i], sph_list[i],
                                          max_distance=max_distance, k_neighbors=k_neighbors,
                                          cost_scale=cost_scale,
-                                         w_pos=w_pos, w_vol=w_vol, w_sph=w_sph, r_max=r_max, s_max=s_max)
+                                         w_pos=w_pos, w_vol=w_vol, w_sph=w_sph, r_max=r_max, s_max=s_max, max_cardinality_percentage=max_cardinality_percentage)
         relabeled_mask = relabel_mask(masks[i], mapping)
         out_path = f"{out_prefix}_round{i+1:02d}_matched.tif"
         tifffile.imwrite(out_path, relabeled_mask.astype(np.int32), compression="zlib")
@@ -187,12 +190,17 @@ def match_multi_round_sparse(mask_path, out_prefix, max_distance, k_neighbors, c
 if __name__ == '__main__':
     masks = "/data/bionets/je30bery/point_set_matching/data"
     out_prefix = "/data/bionets/je30bery/point_set_matching/data/IBEX"
-    max_distance = 30
+    max_distance = 30 # maximum distance between matched nuclei
     r_max = 1.5 # factor by which volumes of two matched nuclei can differ
     s_max = 0.3 # maximum absolute difference in sphericity for two matched nuclei
     w_pos = 1.0
-    w_vol = 50.0
-    w_sph = 100.0
+    w_vol = 2.0
+    w_sph = 3.0
+    max_cardinality_percentage = 0.9
     # TODO spacing = [1, 1, 1]
-    match_multi_round_sparse(masks, out_prefix, max_distance=max_distance, k_neighbors=10, cost_scale=1000,
-                             w_pos=w_pos, w_vol=w_vol, w_sph=w_sph, save_mapping_csv=True, r_max=r_max, s_max=s_max) # TODO, spacing=spacing)
+    for max_cardinality_percentage in [0.9825, 0.985, 0.9875]:
+        print(max_cardinality_percentage)
+        out_dir = os.path.join(out_prefix, str(max_cardinality_percentage * 100))
+        os.makedirs(out_dir, exist_ok=True)
+        match_multi_round_sparse(masks, out_dir, max_distance=max_distance, k_neighbors=10, cost_scale=1000,
+                                w_pos=w_pos, w_vol=w_vol, w_sph=w_sph, save_mapping_csv=True, r_max=r_max, s_max=s_max, max_cardinality_percentage=max_cardinality_percentage) # TODO, spacing=spacing)
