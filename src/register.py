@@ -5,22 +5,37 @@ from ortools.graph.python import max_flow, min_cost_flow
 import tifffile
 import os
 import porespy as ps
+from tqdm import tqdm
 
 
 # Feature extraction
-def extract_centroids_and_labels(labeled): # TODO, spacing):
-    props = ps.metrics.regionprops_3D(labeled) # TODO, spacing=spacing)
+def extract_centroids_and_labels(labeled):  # TODO, spacing):
+    props = ps.metrics.regionprops_3D(labeled)  # TODO, spacing=spacing)
+
     centroids = np.array([p.centroid for p in props], dtype=float)
     label_ids = np.array([p.label for p in props], dtype=int)
     volumes = np.array([p.area for p in props], dtype=float)
-    sphericities = np.array([p.sphericity for p in props], dtype=float)
-    return centroids, label_ids, volumes, sphericities
+
+    principal_axes = []
+    for p in props:
+        I = np.array(p.inertia_tensor, dtype=float)  # 3x3 symmetric
+        eigvals, eigvecs = np.linalg.eigh(I)
+        max_idx = np.argmax(eigvals)
+        principal_axes.append(eigvecs[:, max_idx])  # unit vector
+
+    principal_axes = np.array(principal_axes, dtype=float)
+    return centroids, label_ids, volumes, principal_axes
 
 
-# Build sparse edges with additional features
-def build_sparse_edges(ref_pts, ref_vol, ref_sph, mov_pts, mov_vol, mov_sph, max_distance, k_neighbors, cost_scale, w_pos, w_vol, w_sph, r_max, s_max):
+# Build sparse edges with orientation instead of sphericity
+def build_sparse_edges(ref_pts, ref_vol, ref_axes,
+                       mov_pts, mov_vol, mov_axes,
+                       max_distance, k_neighbors, cost_scale,
+                       r_max, o_max):
     tree_mov = cKDTree(mov_pts)
     edges = []  # list of (ref_idx, mov_idx, int_cost)
+
+    pos_list, vol_list, ori_list = [], [], []
 
     for ref_idx, ref_pt in enumerate(ref_pts):
         dists, mov_indices = tree_mov.query(ref_pt, k=k_neighbors, distance_upper_bound=max_distance)
@@ -29,15 +44,39 @@ def build_sparse_edges(ref_pts, ref_vol, ref_sph, mov_pts, mov_vol, mov_sph, max
         for dist, mov_idx in zip(dists, mov_indices):
             if dist != np.inf and mov_idx < len(mov_pts):
                 vol_ratio = ref_vol[ref_idx] / (mov_vol[mov_idx] + 1e-8)
-                sph_diff = abs(ref_sph[ref_idx] - mov_sph[mov_idx])
+
+                # orientation difference
+                dot = float(np.dot(ref_axes[ref_idx], mov_axes[mov_idx]))
+                orient_diff = np.arccos(np.clip(abs(dot), -1.0, 1.0))  # radians
+
                 if not (1/r_max <= vol_ratio <= r_max):
                     continue  # reject edge
-                if sph_diff > s_max:
+                if orient_diff > o_max:
                     continue  # reject edge
-                # compute cost normally
-                cost = w_pos*dist + w_vol*abs(np.log(vol_ratio)) + w_sph*sph_diff
-                edges.append((ref_idx, mov_idx, int(round(cost*cost_scale))))
+
+                pos_list.append(dist)
+                vol_list.append(abs(np.log(vol_ratio)))
+                ori_list.append(orient_diff)
+                edges.append((ref_idx, mov_idx, 0))  # placeholder for cost
+
+    
+    pos_array = np.array(pos_list)
+    vol_array = np.array(vol_list)
+    ori_array = np.array(ori_list)
+    
+                    
+    if len(edges) > 0:
+        pos_norm = (pos_array - pos_array.min()) / (pos_array.ptp() + 1e-8)
+        vol_norm = (vol_array - vol_array.min()) / (vol_array.ptp() + 1e-8)
+        ori_norm = (ori_array - ori_array.min()) / (ori_array.ptp() + 1e-8)
+
+        # Re-assign normalized cost to edges
+        for i in range(len(edges)):
+            norm_cost = 10*pos_norm[i] + vol_norm[i] + ori_norm[i]  # simple sum
+            edges[i] = (edges[i][0], edges[i][1], int(round(norm_cost * cost_scale)))
+
     return edges
+
 
 
 # Max-flow to compute feasible matching size
@@ -137,18 +176,19 @@ def relabel_mask(mask, mapping):
 
 
 # Multi-round matching
-def match_one_round_sparse(ref_cents, ref_labels, ref_vol, ref_sph, mov_cents, mov_labels, mov_vol, mov_sph, max_distance, k_neighbors, cost_scale, w_pos, w_vol, w_sph, r_max, s_max, max_cardinality_percentage):
-    edges = build_sparse_edges(ref_cents, ref_vol, ref_sph,
-                               mov_cents, mov_vol, mov_sph,
+def match_one_round_sparse(ref_cents, ref_labels, ref_vol, ref_axes, mov_cents, mov_labels, mov_vol, mov_axes, max_distance, k_neighbors, cost_scale, r_max, o_max, max_cardinality_percentage):
+    edges = build_sparse_edges(ref_cents, ref_vol, ref_axes,
+                               mov_cents, mov_vol, mov_axes,
                                max_distance=max_distance,
                                k_neighbors=k_neighbors,
                                cost_scale=cost_scale,
-                               w_pos=w_pos, w_vol=w_vol, w_sph=w_sph, r_max=r_max, s_max=s_max)
+                               r_max=r_max, o_max=o_max)
+
     idx_map = sparse_assignment(edges, max_cardinality_percentage)
     mapping = {int(mov_labels[mov_idx]): int(ref_labels[ref_idx]) for mov_idx, ref_idx in idx_map.items()}
     return mapping
 
-def match_multi_round_sparse(mask_path, out_prefix, max_distance, k_neighbors, cost_scale, w_pos, w_vol, w_sph, save_mapping_csv, r_max, s_max, max_cardinality_percentage): # TODO, spacing):
+def match_multi_round_sparse(mask_path, out_prefix, max_distance, k_neighbors, cost_scale, save_mapping_csv, r_max, o_max, max_cardinality_percentage): # TODO, spacing):
     mask_files = [f for f in os.listdir(mask_path) if f.startswith("aligned")]
     mask_files.sort()
     masks = [tifffile.imread(os.path.join(mask_path, f)) for f in mask_files]
@@ -161,17 +201,17 @@ def match_multi_round_sparse(mask_path, out_prefix, max_distance, k_neighbors, c
         vol_list.append(v)
         sph_list.append(e)
 
-    ref_cents, ref_labels, ref_vol, ref_sph = cents_list[0], labels_list[0], vol_list[0], sph_list[0]
+    ref_cents, ref_labels, ref_vol, ref_axes = cents_list[0], labels_list[0], vol_list[0], sph_list[0]
 
     # Save reference mask
     tifffile.imwrite(f"{out_prefix}_round01_matched.tif", masks[0].astype(np.int32), compression="zlib")
 
     for i in range(1, len(masks)):
-        mapping = match_one_round_sparse(ref_cents, ref_labels, ref_vol, ref_sph,
+        mapping = match_one_round_sparse(ref_cents, ref_labels, ref_vol, ref_axes,
                                          cents_list[i], labels_list[i], vol_list[i], sph_list[i],
                                          max_distance=max_distance, k_neighbors=k_neighbors,
                                          cost_scale=cost_scale,
-                                         w_pos=w_pos, w_vol=w_vol, w_sph=w_sph, r_max=r_max, s_max=s_max, max_cardinality_percentage=max_cardinality_percentage)
+                                         r_max=r_max, o_max=o_max, max_cardinality_percentage=max_cardinality_percentage)
         relabeled_mask = relabel_mask(masks[i], mapping)
         out_path = f"{out_prefix}_round{i+1:02d}_matched.tif"
         tifffile.imwrite(out_path, relabeled_mask.astype(np.int32), compression="zlib")
@@ -190,17 +230,13 @@ def match_multi_round_sparse(mask_path, out_prefix, max_distance, k_neighbors, c
 if __name__ == '__main__':
     masks = "/data/bionets/je30bery/point_set_matching/data"
     out_prefix = "/data/bionets/je30bery/point_set_matching/data/IBEX"
-    max_distance = 30 # maximum distance between matched nuclei
+    max_distance = 50 # maximum distance between matched nuclei
     r_max = 1.5 # factor by which volumes of two matched nuclei can differ
-    s_max = 0.3 # maximum absolute difference in sphericity for two matched nuclei
-    w_pos = 1.0
-    w_vol = 2.0
-    w_sph = 3.0
-    max_cardinality_percentage = 0.9
+    o_max = np.deg2rad(30)  # max 30° difference
+
+    max_cardinality_percentage = 0.98
     # TODO spacing = [1, 1, 1]
-    for max_cardinality_percentage in [0.9825, 0.985, 0.9875]:
-        print(max_cardinality_percentage)
-        out_dir = os.path.join(out_prefix, str(max_cardinality_percentage * 100))
-        os.makedirs(out_dir, exist_ok=True)
-        match_multi_round_sparse(masks, out_dir, max_distance=max_distance, k_neighbors=10, cost_scale=1000,
-                                w_pos=w_pos, w_vol=w_vol, w_sph=w_sph, save_mapping_csv=True, r_max=r_max, s_max=s_max, max_cardinality_percentage=max_cardinality_percentage) # TODO, spacing=spacing)
+    out_dir = os.path.join(out_prefix, str(max_cardinality_percentage * 100))
+    os.makedirs(out_dir, exist_ok=True)
+    match_multi_round_sparse(masks, out_dir, max_distance=max_distance, k_neighbors=10, cost_scale=1000,
+                            save_mapping_csv=True, r_max=r_max, o_max=o_max, max_cardinality_percentage=max_cardinality_percentage) # TODO, spacing=spacing)
